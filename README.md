@@ -158,7 +158,6 @@ cutile-puzzles/
 ├── common/
 │   └── utils.py      # test_puzzle() and bench_puzzle() utilities
 ├── README.md
-└── CLAUDE.md         # AI assistant guidance
 ```
 
 ## License
