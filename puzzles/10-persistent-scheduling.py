@@ -35,22 +35,12 @@ Compute row-wise softmax with persistent scheduling.
 Instead of launching one block per row (like puzzle 06), launch fewer blocks
 that each process multiple rows in a loop. This is the "persistent kernel" pattern.
 
-Pattern:
-    for row_idx in range(ct.bid(0), n_rows, ct.num_blocks(0)):
-        ... process row_idx ...
-
 Each block starts at its own bid and strides by the total number of blocks,
 ensuring all rows are covered without conflicts.
 
 Uses gather/scatter for single-tile-per-row softmax with -inf padding for OOB.
-
-Algorithm per row:
-    1. Gather the row with -inf padding for out-of-bounds elements.
-    2. Cast to float32 for numerical stability.
-    3. Subtract max: shifted = row - ct.max(row, 0, keepdims=True).
-    4. Exponentiate: numerator = ct.exp(shifted).
-    5. Normalize: result = ct.truediv(numerator, ct.sum(numerator, 0, keepdims=True)).
-    6. Cast back and scatter.
+Within each assigned row, perform a numerically stable softmax and write the
+result back with boundary-safe indexing.
 
 Inputs:
     A: Tensor([M, N], float16)
@@ -58,8 +48,7 @@ Inputs:
 Output:
     B: Tensor([M, N], float16)  where B[i,:] = softmax(A[i,:])
 
-HINT: The persistent loop pattern: for row in range(bid, total_rows, num_blocks).
-Use ct.gather(a, (row_idx, offsets), check_bounds=True, padding_value=-math.inf).
+HINT: Use a persistent row loop, and keep softmax numerically stable per row.
 """
 
 
@@ -74,21 +63,9 @@ def ct_persistent_softmax(a, b, n_rows: ConstInt, TILE_N: ConstInt):
     offsets = ct.arange(TILE_N, dtype=ct.int32)
 
     # TODO: Implement persistent softmax
-    # 1. Loop over rows assigned to this block:
-    #    for row_idx in range(pid, n_rows, num_programs):
-    #
-    # 2. Inside the loop, for each row:
-    #    a. Gather the row: ct.gather(a, (row_idx, offsets),
-    #       check_bounds=True, padding_value=-math.inf)
-    #    b. Cast to float32: ct.astype(row, ct.float32)
-    #    c. Compute max: row_max = ct.max(row, 0, keepdims=True)
-    #    d. Subtract max: shifted = ct.sub(row, row_max)
-    #    e. Exponentiate: numerator = ct.exp(shifted)
-    #    f. Sum: denominator = ct.sum(numerator, 0, keepdims=True)
-    #    g. Divide: result = ct.truediv(numerator, denominator)
-    #    h. Cast back: ct.astype(result, a.dtype)
-    #    i. Scatter result: ct.scatter(b, (row_idx, offsets), result,
-    #       check_bounds=True)
+    # Iterate persistently over assigned rows for this block.
+    # For each row, run stable softmax in float32 and scatter back safely.
+    # Keep out-of-bounds elements neutral for softmax.
     pass
 
 
@@ -119,9 +96,7 @@ def run_persistent_softmax():
         ref_persistent_softmax,
         inputs,
         label="10-1 Persistent Softmax",
-        hint="The persistent loop pattern: for row_idx in range(pid, n_rows, num_programs). "
-        "Use gather with padding_value=-math.inf for OOB elements. "
-        "Softmax: subtract max, exp, divide by sum.",
+        hint="Use persistent row scheduling and stable softmax for each assigned row.",
     )
 
 
@@ -134,17 +109,6 @@ Matrix multiplication C = A @ B with persistent scheduling.
 Instead of a 2D grid (one block per output tile), use a 1D grid where
 each block processes multiple output tiles in a persistent loop.
 
-Pattern:
-    bid = ct.bid(0)
-    num_programs = ct.num_blocks(0)
-    tiles_m = ct.cdiv(M, TILE_M)
-    tiles_n = ct.cdiv(N, TILE_N)
-    total_tiles = tiles_m * tiles_n
-    for tile_id in range(bid, total_tiles, num_programs):
-        tile_m = tile_id // tiles_n
-        tile_n = tile_id % tiles_n
-        ... standard GEMM inner loop with ct.mma ...
-
 The key idea is mapping 1D block IDs to 2D tile coordinates, then doing
 a standard tiled GEMM (load A tile, load B tile, ct.mma, accumulate).
 
@@ -155,9 +119,7 @@ Inputs:
 Output:
     C: Tensor([M, N], float16)  where C = A @ B
 
-HINT: The key idea is mapping 1D block IDs to 2D tile coordinates:
-tile_m = tile_id // tiles_n, tile_n = tile_id % tiles_n.
-Then use a standard K-loop with ct.mma.
+HINT: Use persistent tile scheduling, then run tiled GEMM with ct.mma per tile.
 """
 
 
@@ -181,26 +143,9 @@ def ct_persistent_gemm(
     zero_pad = ct.PaddingMode.ZERO
 
     # TODO: Implement persistent GEMM
-    # 1. Loop over output tiles assigned to this block:
-    #    for tile_id in range(bid, total_tiles, num_programs):
-    #
-    # 2. Map 1D tile_id to 2D tile coordinates:
-    #    bid_m = tile_id // tiles_n
-    #    bid_n = tile_id % tiles_n
-    #
-    # 3. Initialize accumulator:
-    #    accumulator = ct.full((TILE_M, TILE_N), 0.0, dtype=ct.float32)
-    #
-    # 4. K-dimension loop:
-    #    for k in range(k_tiles):
-    #        a. Load A tile: ct.load(a, index=(bid_m, k),
-    #           shape=(TILE_M, TILE_K), padding_mode=zero_pad)
-    #        b. Load B tile: ct.load(b, index=(k, bid_n),
-    #           shape=(TILE_K, TILE_N), padding_mode=zero_pad)
-    #        c. Accumulate: accumulator = ct.mma(a_tile, b_tile, accumulator)
-    #
-    # 5. Cast to output dtype: ct.astype(accumulator, c.dtype)
-    # 6. Store: ct.store(c, index=(bid_m, bid_n), tile=result)
+    # Iterate persistently over output tiles assigned to this block.
+    # Map each logical tile to matrix coordinates, then run tiled ct.mma GEMM.
+    # Keep accumulation in float32 before final cast/store.
     pass
 
 
@@ -237,9 +182,7 @@ def run_persistent_gemm():
         ref_persistent_gemm,
         inputs,
         label="10-2 Persistent GEMM",
-        hint="Map 1D tile_id to 2D: bid_m = tile_id // tiles_n, bid_n = tile_id %% tiles_n. "
-        "Then standard K-loop: load A tile at (bid_m, k), B tile at (k, bid_n), "
-        "ct.mma to accumulate.",
+        hint="Use persistent output-tile scheduling and tiled ct.mma accumulation.",
     )
 
 

@@ -32,16 +32,9 @@ Compute the sum of each row: B[i] = sum(A[i, :])
 
 Assumes the entire row fits in one tile (N <= TILE_N), so each block
 processes one row with a single load and reduce.
-
-Algorithm:
-    1. Use ct.bid(0) to get the row index (one block per row).
-    2. Load the row as a 2D tile of shape (1, TILE_N) from A.
-       Use padding_mode=ct.PaddingMode.ZERO so out-of-bounds elements
-       contribute 0 to the sum.
-    3. Upcast to float32 for numerical precision: ct.astype(tile, ct.float32).
-    4. Reduce along axis=1: row_sum = ct.sum(tile, axis=1).
-       This produces a tile of shape (1,).
-    5. Store the scalar result to B at index (bid,) using the reshaped tile.
+Use one block per row tile. Load with zero padding so out-of-bounds values
+do not affect the sum, accumulate in float32 for precision, then store one
+value per row.
 
 Inputs:
     A: Tensor([M, N], float32)
@@ -49,9 +42,8 @@ Inputs:
 Output:
     B: Tensor([M,], float32)  where B[i] = sum(A[i, :])
 
-HINT: ct.sum(tile, axis=1) reduces along columns. Use ct.astype to upcast
-to float32 before summing. ct.load with padding_mode=ct.PaddingMode.ZERO
-ensures OOB elements are zero-padded.
+HINT: Think in row tiles: load once, reduce across columns, and write one
+output value per row.
 """
 
 
@@ -65,11 +57,9 @@ def ct_row_sum(a, b, TILE_N: ConstInt):
     bid = ct.bid(0)
 
     # TODO: Implement single-tile row sum
-    # 1. Load a 2D tile of shape (1, TILE_N) from a at index (bid, 0)
-    #    with padding_mode=ct.PaddingMode.ZERO
-    # 2. Cast to float32 using ct.astype(tile, ct.float32)
-    # 3. Sum along axis=1: ct.sum(tile, axis=1) -> shape (1,)
-    # 4. Reshape to (1,) and store to b at index (bid,)
+    # Use one load/store path per row tile.
+    # Accumulate in float32, then write the reduced value to b.
+    # Ensure out-of-bounds elements are neutral for summation.
     pass
 
 
@@ -93,8 +83,7 @@ def run_row_sum():
         ref_row_sum,
         inputs,
         label="05-1 Row Sum (single-tile)",
-        hint="Load a (1, TILE_N) tile per row, ct.sum(tile, axis=1) to reduce, "
-        "then store the scalar result.",
+        hint="Use a row-tile reduction and keep accumulation in float32.",
     )
 
 
@@ -107,16 +96,8 @@ B[i] = sum(A[i, :])
 
 When N > TILE_N, we must loop over chunks of the row, accumulating
 partial sums.
-
-Algorithm:
-    1. Use ct.bid(0) to get the row index.
-    2. Initialize an accumulator: acc = ct.full((1,), 0.0, dtype=ct.float32).
-    3. Loop over chunks: for chunk_idx in range(NUM_CHUNKS):
-        a. Load a (1, TILE_N) tile from A at index (bid, chunk_idx).
-        b. Cast to float32.
-        c. Sum along axis=1 to get a partial sum of shape (1,).
-        d. Add to accumulator: acc = acc + partial_sum.
-    4. Store the final accumulator to B.
+Use a running accumulator per row and sweep over row chunks. Each chunk
+contributes a partial sum; combine all partial sums and write one final value.
 
 NUM_CHUNKS = ceil(N / TILE_N), passed as a compile-time constant.
 
@@ -126,9 +107,7 @@ Inputs:
 Output:
     B: Tensor([M,], float32)  where B[i] = sum(A[i, :])
 
-HINT: Use ct.full((1,), 0.0, dtype=ct.float32) to create a zero accumulator.
-Loop over chunks with a Python for-loop. ct.load handles out-of-bounds
-padding automatically.
+HINT: Treat this as chunked reduction with a running accumulator per row.
 """
 
 
@@ -137,14 +116,9 @@ def ct_row_sum_chunked(a, b, TILE_N: ConstInt, NUM_CHUNKS: ConstInt):
     bid = ct.bid(0)
 
     # TODO: Implement chunked row sum
-    # 1. Initialize accumulator: ct.full((1,), 0.0, dtype=ct.float32)
-    # 2. Loop over chunks: for chunk_idx in range(NUM_CHUNKS):
-    #    a. Load (1, TILE_N) tile from a at index (bid, chunk_idx)
-    #       with padding_mode=ct.PaddingMode.ZERO
-    #    b. Cast to float32
-    #    c. Compute partial sum: ct.sum(tile, axis=1)
-    #    d. Add partial sum to accumulator
-    # 3. Store accumulator to b at index (bid,)
+    # Iterate over row chunks and accumulate partial reductions in float32.
+    # Keep the accumulator per row and store it after all chunks are processed.
+    # Out-of-bounds values should not contribute to the result.
     pass
 
 
@@ -174,8 +148,7 @@ def run_row_sum_chunked():
         ref_row_sum,
         inputs,
         label="05-2 Row Sum (chunked)",
-        hint="Initialize acc = ct.full((1,), 0.0, dtype=ct.float32). "
-        "Loop over chunks, summing each (1, TILE_N) tile and adding to acc.",
+        hint="Use chunked row reduction with a running float32 accumulator.",
     )
 
 
