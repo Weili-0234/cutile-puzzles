@@ -31,19 +31,9 @@ r"""
 Compute RMSNorm for each row: B[i, :] = A[i, :] / rms(A[i, :])
 
 where rms(x) = sqrt(mean(x^2) + eps)
-
-Algorithm:
-    1. Use ct.bid(0) to get the row index (one block per row).
-    2. Load the row as a (1, TILE_N) tile from A.
-       Use padding_mode=ct.PaddingMode.ZERO so OOB elements are zero.
-    3. Cast to float32 for precision: ct.astype(tile, ct.float32).
-    4. Square: x_sq = tile * tile.
-    5. Mean of squares: mean_sq = ct.sum(x_sq, axis=1, keepdims=True) / N.
-       (Divide by N, not TILE_N, to get the correct mean over actual elements.)
-    6. Add epsilon: mean_sq_eps = mean_sq + eps.
-    7. Inverse sqrt: rstd = ct.rsqrt(mean_sq_eps).
-    8. Normalize: result = tile * rstd.
-    9. Cast back to original dtype and store.
+Use one row tile per block, compute normalization in float32, and scale the
+input row by the inverse root-mean-square. Use the real row length `N` for
+the mean, not the tile size.
 
 Inputs:
     A: Tensor([M, N], float16)
@@ -51,8 +41,7 @@ Inputs:
 Output:
     B: Tensor([M, N], float16)  where B[i,:] = A[i,:] / rms(A[i,:])
 
-HINT: ct.rsqrt computes 1/sqrt(x). Use ct.sum with axis=1 and divide by N
-for the mean. Don't forget to add eps before rsqrt.
+HINT: Keep the normalization path in float32 and apply epsilon before rsqrt.
 """
 
 
@@ -67,17 +56,9 @@ def ct_rmsnorm(a, b, N_VAL: ConstInt, TILE_N: ConstInt, EPS: ConstFloat):
     bid = ct.bid(0)
 
     # TODO: Implement basic RMSNorm
-    # 1. Load (1, TILE_N) tile from a at (bid, 0)
-    #    with padding_mode=ct.PaddingMode.ZERO
-    # 2. Cast to float32: ct.astype(tile, ct.float32)
-    # 3. Square: x_sq = tile * tile
-    # 4. Sum of squares: sum_sq = ct.sum(x_sq, axis=1, keepdims=True)
-    # 5. Mean: mean_sq = sum_sq / N_VAL
-    # 6. Add eps: mean_sq_eps = mean_sq + EPS
-    # 7. Inverse sqrt: rstd = ct.rsqrt(mean_sq_eps)
-    # 8. Normalize: result = tile * rstd
-    # 9. Cast back: ct.astype(result, ct.float16)
-    # 10. Store to b at (bid, 0)
+    # Compute row RMS in float32, then normalize the row tile.
+    # Use N_VAL for the mean and include EPS before rsqrt.
+    # Cast back to output dtype when storing.
     pass
 
 
@@ -107,8 +88,7 @@ def run_rmsnorm():
         ref_rmsnorm,
         inputs,
         label="07-1 RMSNorm (basic)",
-        hint="Compute mean of squares with ct.sum / N, then ct.rsqrt(mean_sq + eps). "
-        "Multiply input by rstd to normalize.",
+        hint="Compute RMS in float32, apply eps-stabilized rsqrt, then normalize.",
     )
 
 
@@ -121,13 +101,8 @@ B[i, :] = (A[i, :] / rms(A[i, :])) * W[:]
 
 Same as 07-1 but the normalized output is multiplied element-wise by a
 weight vector W of shape (N,).
-
-Algorithm:
-    1-8. Same as 07-1 (load, cast, square, mean, rsqrt, normalize).
-    9.  Load weight: w = ct.load(W, (0,), shape=(TILE_N,)).
-        Reshape to (1, TILE_N) for broadcasting.
-    10. Multiply: result = normalized * w.
-    11. Cast back and store.
+This keeps the same RMS computation, then applies a learned weight vector
+element-wise to the normalized row.
 
 Inputs:
     A: Tensor([M, N], float16)
@@ -136,8 +111,7 @@ Inputs:
 Output:
     B: Tensor([M, N], float16)  where B[i,:] = (A[i,:] / rms(A[i,:])) * W[:]
 
-HINT: Load the weight vector with ct.load(W, (0,), shape=(TILE_N,)) and
-reshape to (1, TILE_N) for broadcasting with the (1, TILE_N) normalized tile.
+HINT: Reuse the RMS path from 07-1, then apply the learned weight per feature.
 """
 
 
@@ -154,16 +128,9 @@ def ct_rmsnorm_weighted(
     bid = ct.bid(0)
 
     # TODO: Implement RMSNorm with learned weight
-    # 1. Load (1, TILE_N) tile from a at (bid, 0) with ZERO padding
-    # 2. Cast to float32
-    # 3. Square and compute mean: sum(x^2) / N_VAL
-    # 4. Add eps and rsqrt
-    # 5. Normalize: tile * rstd
-    # 6. Load weight: ct.load(w, (0,), shape=(TILE_N,))
-    # 7. Reshape weight to (1, TILE_N) for broadcasting
-    # 8. Cast weight to float32
-    # 9. Multiply normalized by weight
-    # 10. Cast back to float16 and store to b at (bid, 0)
+    # Implement RMSNorm as in 07-1, then apply per-feature weight.
+    # Keep normalization and weighting math in float32.
+    # Cast to output dtype before storing.
     pass
 
 
@@ -194,8 +161,7 @@ def run_rmsnorm_weighted():
         ref_rmsnorm_weighted,
         inputs,
         label="07-2 RMSNorm (weighted)",
-        hint="Same as 07-1 but also load W with ct.load(w, (0,), shape=(TILE_N,)). "
-        "Reshape to (1, TILE_N) and multiply with normalized result.",
+        hint="Use 07-1 RMSNorm flow, then apply learned per-feature scaling.",
     )
 
 

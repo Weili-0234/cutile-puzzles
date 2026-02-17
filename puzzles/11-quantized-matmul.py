@@ -34,15 +34,8 @@ Mathematically:
     C[i, j] = scale_A[i] * scale_B[j] * sum_k(A_fp8[i, k] * B_fp8[k, j])
 
 The key insight is that scale factors can be applied AFTER the matmul:
-    1. Compute the raw FP8 matmul: acc = A_fp8 @ B_fp8 (in float32).
-    2. Apply scales: result = acc * scale_A[:, None] * scale_B[None, :].
-
-Implementation:
-    1. Standard 2D tiled GEMM with ct.mma (fp8 inputs, fp32 accumulator).
-    2. After the K-loop, gather scale factors for the tile's rows/columns.
-    3. Reshape scales for broadcasting: (TILE_M, 1) and (1, TILE_N).
-    4. Multiply accumulator by both scale tiles.
-    5. Cast to bfloat16 and store.
+compute unscaled FP8 GEMM in float32 first, then apply per-row/per-column
+scales to the output tile before storing.
 
 Inputs:
     A_fp8:   Tensor([M, K], float8_e4m3fn)
@@ -53,9 +46,7 @@ Inputs:
 Output:
     C: Tensor([M, N], bfloat16)
 
-HINT: ct.mma supports fp8 inputs with fp32 accumulator. After the K-loop,
-gather scale factors and reshape to (TILE_M, 1) and (1, TILE_N) for broadcasting.
-Use .reshape((TILE_M, 1)) and .reshape((1, TILE_N)) on the gathered scale tiles.
+HINT: Separate concerns: accumulate GEMM in fp32, then apply per-channel scales.
 """
 
 
@@ -85,28 +76,9 @@ def ct_fp8_matmul(
     zero_pad = ct.PaddingMode.ZERO
 
     # TODO: Implement FP8 per-channel quantized GEMM
-    #
-    # 1. Initialize float32 accumulator:
-    #    accumulator = ct.full((TILE_M, TILE_N), 0.0, dtype=ct.float32)
-    #
-    # 2. K-loop (ct.mma supports fp8 inputs with fp32 accumulator):
-    #    for k in range(k_tiles):
-    #        a. Load A tile: ct.load(a, index=(bid_m, k),
-    #           shape=(TILE_M, TILE_K), padding_mode=zero_pad)
-    #        b. Load B tile: ct.load(b, index=(k, bid_n),
-    #           shape=(TILE_K, TILE_N), padding_mode=zero_pad)
-    #        c. Accumulate: accumulator = ct.mma(a_tile, b_tile, accumulator)
-    #
-    # 3. Load per-channel scale factors using gather:
-    #    row_offsets = bid_m * TILE_M + ct.arange(TILE_M, dtype=ct.int32)
-    #    col_offsets = bid_n * TILE_N + ct.arange(TILE_N, dtype=ct.int32)
-    #    sa = ct.gather(scale_a, row_offsets).reshape((TILE_M, 1))
-    #    sb = ct.gather(scale_b, col_offsets).reshape((1, TILE_N))
-    #
-    # 4. Apply scaling: accumulator = accumulator * sa * sb
-    #
-    # 5. Cast to output dtype: ct.astype(accumulator, c.dtype)
-    # 6. Store: ct.store(c, index=(bid_m, bid_n), tile=result)
+    # Run tiled fp8 GEMM with float32 accumulation.
+    # After K-reduction, apply per-row and per-column scales to the tile.
+    # Cast to output dtype only at final store.
     pass
 
 
@@ -162,9 +134,7 @@ def run_fp8_matmul():
         ref_fp8_matmul,
         inputs,
         label="11-1 FP8 Per-Channel Quantized GEMM",
-        hint="ct.mma supports fp8 inputs with fp32 accumulator. After the K-loop, "
-        "gather scales and reshape to (TILE_M, 1) and (1, TILE_N) for broadcasting. "
-        "Multiply accumulator by both scales.",
+        hint="Accumulate fp8 matmul in float32 first, then apply per-channel scaling.",
     )
 
 

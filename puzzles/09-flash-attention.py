@@ -39,23 +39,9 @@ attention over all key/value positions.
 
 Q: (M,), K: (N,), V: (N,), Output: (M,)
 
-Uses online softmax (streaming over KV tiles) for numerical stability:
-    1. Each block handles TILE_M query positions.
-    2. Initialize per-query accumulators:
-        m_i = ct.full((TILE_M,), -inf, ct.float32)   — running max
-        l_i = ct.full((TILE_M,), 0.0, ct.float32)    — running sum of exp
-        o_i = ct.full((TILE_M,), 0.0, ct.float32)    — running weighted sum
-    3. For each KV chunk of size TILE_N:
-        a. Load q_tile: (TILE_M,), k_tile: (TILE_N,), v_tile: (TILE_N,).
-        b. Compute scores: qk = q_tile[:, None] * k_tile[None, :] — shape (TILE_M, TILE_N).
-        c. Scale for exp2: qk = qk * INV_LOG_2
-        d. New running max: m_new = max(m_i, ct.max(qk, axis=1))
-        e. Correction factor: alpha = ct.exp2(m_i - m_new)
-        f. Shifted exp: p = ct.exp2(qk - m_new[:, None])
-        g. Update sum: l_i = l_i * alpha + ct.sum(p, axis=1)
-        h. Update output: o_i = o_i * alpha + ct.sum(p * v_tile[None, :], axis=1)
-        i. m_i = m_new
-    4. Final normalization: O = o_i / l_i
+Use online softmax while streaming KV chunks. Track running statistics in
+float32 so previously accumulated values remain valid when the local maximum
+changes from one chunk to the next.
 
 Inputs:
     Q: Tensor([M,], float32)
@@ -65,9 +51,7 @@ Inputs:
 Output:
     O: Tensor([M,], float32)
 
-HINT: Use ct.exp2 with INV_LOG_2 scaling for performance. The key insight
-of online softmax is that you can correct previous partial sums when the
-running maximum changes, via the alpha = exp2(m_old - m_new) factor.
+HINT: Focus on maintaining stable running softmax statistics across KV chunks.
 """
 
 
@@ -83,24 +67,9 @@ def ct_scalar_attention(q, k, v, o, N_val: int, TILE_M: ConstInt, TILE_N: ConstI
     num_tiles_n = ct.cdiv(N_val, TILE_N)
 
     # TODO: Implement scalar flash attention with online softmax
-    # 1. Load q_tile at index (bid,) with shape (TILE_M,)
-    # 2. Initialize accumulators:
-    #    m_i = ct.full((TILE_M,), -math.inf, dtype=ct.float32)  — running max
-    #    l_i = ct.full((TILE_M,), 0.0, dtype=ct.float32)        — running exp sum
-    #    o_i = ct.full((TILE_M,), 0.0, dtype=ct.float32)        — running output
-    # 3. Loop over KV chunks: for j in range(num_tiles_n):
-    #    a. Load k_tile at (j,) with shape (TILE_N,)
-    #    b. Load v_tile at (j,) with shape (TILE_N,)
-    #    c. Compute scores: qk = q_tile[:, None] * k_tile[None, :]  — (TILE_M, TILE_N)
-    #    d. Scale: qk = qk * INV_LOG_2
-    #    e. Row max: m_new = max(m_i, ct.max(qk, axis=1))
-    #    f. Correction: alpha = ct.exp2(m_i - m_new)
-    #    g. Exp weights: p = ct.exp2(qk - m_new[:, None])
-    #    h. Update: l_i = l_i * alpha + ct.sum(p, axis=1)
-    #    i. Update: o_i = o_i * alpha + ct.sum(p * v_tile[None, :], axis=1)
-    #    j. m_i = m_new
-    # 4. Normalize: result = o_i / l_i
-    # 5. Store to o at index (bid,)
+    # Compute scalar flash attention with online softmax across KV chunks.
+    # Maintain running max/sum/output state in float32 for stability.
+    # Normalize once all chunks for this query tile are processed.
     pass
 
 
@@ -133,8 +102,7 @@ def run_scalar_attention():
         ref_scalar_attention,
         inputs,
         label="09-1 Scalar Flash Attention",
-        hint="Online softmax: track m_i (running max), l_i (running sum of exp), "
-        "o_i (running output). Correct old values with alpha = exp2(m_old - m_new).",
+        hint="Use online softmax state updates so chunked attention stays stable.",
     )
 
 
@@ -145,30 +113,9 @@ r"""
 Full FlashAttention with matrix multiply: Q @ K^T -> softmax -> @ V.
 
 Q: (M, D), K: (N, D), V: (N, D), Output: (M, D)
-
-Algorithm:
-    1. Each block handles TILE_M query rows.
-    2. Load Q tile: (TILE_M, D) at index (bid, 0). Keep in original dtype for ct.mma.
-    3. Compute qk_scale_log2 = qk_scale * INV_LOG_2 (for use with exp2).
-    4. Initialize accumulators:
-        m_i: (TILE_M, 1) = -inf     — running max per query
-        l_i: (TILE_M, 1) = 0.0      — running exp sum per query
-        acc: (TILE_M, D) = 0.0       — running output accumulator
-    5. For each KV chunk of TILE_N:
-        a. Load K tile: (TILE_N, D), transpose to (D, TILE_N).
-        b. QK = ct.mma(q_tile, k_transposed, zeros) -> (TILE_M, TILE_N) in float32.
-        c. Apply scale after mma (on float32 result):
-           m_new = max(m_i, ct.max(QK, axis=-1, keepdims=True) * qk_scale_log2)
-           QK = QK * qk_scale_log2 - m_new
-        d. Correction: alpha = ct.exp2(m_i - m_new)
-        e. Softmax weights: p = ct.exp2(QK)  — already shifted by m_new
-        f. Update l_i = l_i * alpha + ct.sum(p, axis=-1, keepdims=True)
-        g. Scale acc: acc = acc * alpha
-        h. Load V tile: (TILE_N, D).
-        i. Cast p to input dtype and accumulate: acc = ct.mma(p_cast, v_tile, acc)
-        j. m_i = m_new
-    6. Normalize: acc = acc / l_i
-    7. Store at (bid, 0).
+Each block handles a query tile, computes tiled QK scores, applies online
+softmax over KV chunks, accumulates PV in float32, then normalizes to produce
+the output tile.
 
 Inputs:
     Q: Tensor([M, D], float16)
@@ -178,10 +125,8 @@ Inputs:
 Output:
     O: Tensor([M, D], float16)
 
-HINT: To transpose K for QK computation, load K at (j, 0) with shape (TILE_N, D)
-and use ct.transpose(k_tile) to get (D, TILE_N). Keep Q in its original dtype for
-ct.mma and apply qk_scale to the float32 QK result. The alpha correction factor
-broadcasts from (TILE_M, 1) to (TILE_M, D).
+HINT: Keep QK/PV accumulation high precision and preserve online-softmax state
+consistency across chunks.
 """
 
 
@@ -202,31 +147,9 @@ def ct_tiled_attention(
     num_tiles_n = ct.cdiv(N_val, TILE_N)
 
     # TODO: Implement tiled flash attention with ct.mma
-    # 1. Compute qk_scale_log2 = qk_scale * INV_LOG_2
-    # 2. Load q_tile at (bid, 0) with shape (TILE_M, TILE_D) — keep in original dtype
-    # 3. Initialize accumulators:
-    #    m_i = ct.full((TILE_M, 1), -math.inf, dtype=ct.float32)
-    #    l_i = ct.full((TILE_M, 1), 0.0, dtype=ct.float32)
-    #    acc = ct.full((TILE_M, TILE_D), 0.0, dtype=ct.float32)
-    # 4. Loop over KV chunks: for j in range(num_tiles_n):
-    #    a. Load k_tile at (j, 0) with shape (TILE_N, TILE_D)
-    #    b. Transpose K: k_t = ct.transpose(k_tile) — gives (TILE_D, TILE_N)
-    #    c. Compute QK scores (both inputs are float16, result is float32):
-    #       qk = ct.full((TILE_M, TILE_N), 0.0, dtype=ct.float32)
-    #       qk = ct.mma(q_tile, k_t, qk) — (TILE_M, TILE_N)
-    #    d. Apply scale to float32 QK and compute row max:
-    #       m_new = max(m_i, ct.max(qk, axis=-1, keepdims=True) * qk_scale_log2)
-    #       qk = qk * qk_scale_log2 - m_new  — scale and shift in one step
-    #    e. Correction: alpha = ct.exp2(m_i - m_new)
-    #    f. Softmax weights: p = ct.exp2(qk) — already shifted by m_new
-    #    g. Update exp sum: l_i = l_i * alpha + ct.sum(p, axis=-1, keepdims=True)
-    #    h. Scale accumulator: acc = acc * alpha
-    #    i. Load v_tile at (j, 0) with shape (TILE_N, TILE_D)
-    #    j. Cast p to input dtype: p_cast = p.astype(q_arr.dtype)
-    #    k. Accumulate PV: acc = ct.mma(p_cast, v_tile, acc)
-    #    l. Update running max: m_i = m_new
-    # 5. Normalize: acc = acc / l_i
-    # 6. Cast and store: ct.store(o_arr, (bid, 0), acc.astype(o_arr.dtype))
+    # Implement tiled flash attention with online softmax and ct.mma.
+    # Keep running statistics and output accumulation in float32.
+    # Normalize at the end and store in output dtype.
     pass
 
 
@@ -261,8 +184,7 @@ def run_tiled_attention():
         ref_tiled_attention,
         inputs,
         label="09-2 Tiled Flash Attention (ct.mma)",
-        hint="Transpose K with ct.transpose(k_tile). Apply qk_scale * INV_LOG_2 to the "
-        "float32 QK result (not to Q). Cast p to input dtype before ct.mma with V.",
+        hint="Combine tiled QK/PV matmuls with online-softmax state updates in float32.",
     )
 
 

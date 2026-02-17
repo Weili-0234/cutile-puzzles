@@ -32,19 +32,8 @@ Compute a matrix-vector product: C[i] = sum_k(A[i, k] * B[k])
 Each block processes TILE_M rows of the output. The K dimension is
 iterated in chunks of TILE_K, with partial products accumulated
 in float32 for numerical stability.
-
-Algorithm:
-    1. bid = ct.bid(0) selects which TILE_M rows this block handles.
-    2. Initialize accumulator: ct.full((TILE_M,), 0.0, dtype=ct.float32).
-    3. Loop over K in chunks (num_tiles_k iterations):
-        a. Load A tile: shape (TILE_M, TILE_K) at index (bid, k).
-        b. Load B tile: shape (TILE_K,) at index (k,).
-        c. Cast both to float32.
-        d. Broadcast B across rows and multiply: prod = a_tile * b_tile[None, :]
-           — this gives (TILE_M, TILE_K).
-        e. Sum along axis=1 to get partial result of shape (TILE_M,).
-        f. Add to accumulator.
-    4. Cast accumulator to output dtype and store.
+Think in tiles: each block owns a row tile of `C`, streams across K-chunks,
+accumulates partial dot-products in float32, then writes the output tile.
 
 Inputs:
     A: Tensor([M, K], float16)
@@ -53,8 +42,7 @@ Inputs:
 Output:
     C: Tensor([M,], float16)  where C[i] = sum_k(A[i, k] * B[k])
 
-HINT: Use ct.load with padding_mode=ct.PaddingMode.ZERO. Broadcast B
-with b_tile[None, :] to shape (1, TILE_K) before multiplying with A tile.
+HINT: Structure GEMV as tiled dot products over K with float32 accumulation.
 """
 
 
@@ -68,16 +56,9 @@ def ct_gemv(a, b, c, TILE_M: ConstInt, TILE_K: ConstInt):
     num_tiles_k = ct.num_tiles(a, axis=1, shape=(TILE_M, TILE_K))
 
     # TODO: Implement GEMV (matrix-vector multiply)
-    # 1. Initialize accumulator: ct.full((TILE_M,), 0.0, dtype=ct.float32)
-    # 2. Loop over K dimension: for k in range(num_tiles_k):
-    #    a. Load A tile at (bid, k) with shape (TILE_M, TILE_K), padding_mode=ct.PaddingMode.ZERO
-    #    b. Load B tile at (k,) with shape (TILE_K,), padding_mode=ct.PaddingMode.ZERO
-    #    c. Cast both tiles to float32 using .astype(ct.float32)
-    #    d. Multiply: a_tile * b_tile[None, :] — broadcasts (TILE_K,) to (1, TILE_K)
-    #    e. Sum along axis=1: ct.sum(product, axis=1) — gives shape (TILE_M,)
-    #    f. Add partial sum to accumulator
-    # 3. Cast accumulator to output dtype: acc.astype(c.dtype)
-    # 4. Store to c at index (bid,)
+    # Iterate over K tiles, accumulate each row's dot-product in float32,
+    # and write the final TILE_M outputs for this block.
+    # Handle boundary tiles safely when loading.
     pass
 
 
@@ -103,8 +84,7 @@ def run_gemv():
         ref_gemv,
         inputs,
         label="08-1 GEMV",
-        hint="Broadcast b_tile[None, :] to (1, TILE_K), multiply with a_tile, "
-        "then ct.sum along axis=1 to reduce K.",
+        hint="Treat GEMV as tiled row-wise dot products over K in float32.",
     )
 
 
@@ -120,17 +100,8 @@ to output positions. The K dimension is iterated in chunks of TILE_K.
 Instead of tensor core instructions, we use the Python @ operator on tiles
 (ct.matmul), which still performs a tiled matrix multiply but without
 hardware MMA acceleration.
-
-Algorithm:
-    1. bid_m = ct.bid(0), bid_n = ct.bid(1) — 2D block indices.
-    2. Compute num_tiles_k = ct.num_tiles(A, axis=1, shape=(TILE_M, TILE_K)).
-    3. Initialize accumulator: ct.full((TILE_M, TILE_N), 0.0, dtype=ct.float32).
-    4. Loop over K chunks:
-        a. Load A tile: shape (TILE_M, TILE_K) at index (bid_m, k).
-        b. Load B tile: shape (TILE_K, TILE_N) at index (k, bid_n).
-        c. Cast both to float32.
-        d. Accumulate: acc = acc + (a_tile @ b_tile).
-    5. Cast to output dtype and store at (bid_m, bid_n).
+Each block computes one output tile. Accumulate across K-tiles in float32 and
+store after the full reduction.
 
 Inputs:
     A: Tensor([M, K], float16)
@@ -139,8 +110,7 @@ Inputs:
 Output:
     C: Tensor([M, N], float16)  where C[i, j] = sum_k(A[i, k] * B[k, j])
 
-HINT: The @ operator on cutile tiles performs matrix multiplication.
-a_tile @ b_tile with shapes (TILE_M, TILE_K) @ (TILE_K, TILE_N) gives (TILE_M, TILE_N).
+HINT: Keep a float32 accumulator per output tile and reduce across K tiles.
 """
 
 
@@ -155,16 +125,9 @@ def ct_gemm_naive(a, b, c, TILE_M: ConstInt, TILE_N: ConstInt, TILE_K: ConstInt)
     num_tiles_k = ct.num_tiles(a, axis=1, shape=(TILE_M, TILE_K))
 
     # TODO: Implement naive GEMM (no ct.mma)
-    # 1. Initialize accumulator: ct.full((TILE_M, TILE_N), 0.0, dtype=ct.float32)
-    # 2. Loop over K: for k in range(num_tiles_k):
-    #    a. Load A tile at (bid_m, k) with shape (TILE_M, TILE_K),
-    #       padding_mode=ct.PaddingMode.ZERO
-    #    b. Load B tile at (k, bid_n) with shape (TILE_K, TILE_N),
-    #       padding_mode=ct.PaddingMode.ZERO
-    #    c. Cast both tiles to float32
-    #    d. Matrix multiply and accumulate: acc = acc + (a_tile @ b_tile)
-    # 3. Cast accumulator to output dtype: acc.astype(c.dtype)
-    # 4. Store to c at index (bid_m, bid_n)
+    # Compute one output tile per block by reducing over K tiles.
+    # Use float32 accumulation before casting to output dtype.
+    # Boundary tiles should remain safe under padding.
     pass
 
 
@@ -195,7 +158,7 @@ def run_gemm_naive():
         ref_gemm,
         inputs,
         label="08-2 Naive GEMM",
-        hint="Load A at (bid_m, k), B at (k, bid_n). Use @ operator: acc = acc + (a_tile @ b_tile).",
+        hint="Use tiled K-reduction with a float32 accumulator for each output tile.",
     )
 
 
@@ -208,16 +171,8 @@ Compute C = A @ B using ct.mma for tensor core acceleration.
 ct.mma(a, b, acc) computes acc += a @ b using hardware matrix-multiply-accumulate
 instructions (tensor cores). The accumulator must be float32; input tiles can be
 float16 or bfloat16.
-
-Algorithm:
-    1. bid_m = ct.bid(0), bid_n = ct.bid(1) — 2D block indices.
-    2. Compute num_tiles_k = ct.num_tiles(A, axis=1, shape=(TILE_M, TILE_K)).
-    3. Initialize accumulator: ct.full((TILE_M, TILE_N), 0, dtype=ct.float32).
-    4. Loop over K chunks:
-        a. Load A tile: shape (TILE_M, TILE_K) at index (bid_m, k).
-        b. Load B tile: shape (TILE_K, TILE_N) at index (k, bid_n).
-        c. MMA: accumulator = ct.mma(a_tile, b_tile, accumulator).
-    5. Cast to output dtype and store at (bid_m, bid_n).
+As in naive GEMM, each block computes one output tile and reduces over K.
+The key difference is using `ct.mma` for tensor-core accumulation.
 
 Inputs:
     A: Tensor([M, K], float16)
@@ -226,8 +181,7 @@ Inputs:
 Output:
     C: Tensor([M, N], float16)  where C[i, j] = sum_k(A[i, k] * B[k, j])
 
-HINT: ct.mma(a_tile, b_tile, accumulator) — a_tile is (M, K), b_tile is (K, N),
-accumulator is (M, N) in float32. No need to cast input tiles — ct.mma handles it.
+HINT: Use `ct.mma` in the K-reduction loop with a float32 accumulator tile.
 """
 
 
@@ -238,15 +192,9 @@ def ct_gemm_mma(a, b, c, TILE_M: ConstInt, TILE_N: ConstInt, TILE_K: ConstInt):
     num_tiles_k = ct.num_tiles(a, axis=1, shape=(TILE_M, TILE_K))
 
     # TODO: Implement GEMM with ct.mma (tensor cores)
-    # 1. Initialize accumulator: ct.full((TILE_M, TILE_N), 0, dtype=ct.float32)
-    # 2. Loop over K: for k in range(num_tiles_k):
-    #    a. Load A tile at (bid_m, k) with shape (TILE_M, TILE_K),
-    #       padding_mode=ct.PaddingMode.ZERO
-    #    b. Load B tile at (k, bid_n) with shape (TILE_K, TILE_N),
-    #       padding_mode=ct.PaddingMode.ZERO
-    #    c. Tensor core MMA: accumulator = ct.mma(a_tile, b_tile, accumulator)
-    # 3. Cast to output dtype: ct.astype(accumulator, c.dtype)
-    # 4. Store to c at index (bid_m, bid_n)
+    # Follow tiled GEMM structure, but use ct.mma for K-chunk accumulation.
+    # Keep the accumulator in float32 and cast only for final store.
+    # Handle edge tiles via safe load behavior.
     pass
 
 
@@ -277,8 +225,7 @@ def run_gemm_mma():
         ref_gemm,
         inputs,
         label="08-3 GEMM (ct.mma)",
-        hint="ct.mma(a_tile, b_tile, accumulator) — no need to cast inputs. "
-        "Accumulator must be float32.",
+        hint="Use ct.mma for K-tile accumulation and keep accumulator precision high.",
     )
 
 
